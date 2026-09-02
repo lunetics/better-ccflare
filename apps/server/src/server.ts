@@ -55,6 +55,7 @@ import {
 import {
 	AutoRefreshScheduler,
 	CacheKeepaliveScheduler,
+	createStaleWeeklyResetRecovery,
 	drainUsageCollector,
 	forceCloseCircuit,
 	getCodexModels,
@@ -343,6 +344,11 @@ let stopIntegritySchedulerJob: (() => void) | null = null;
 let stopModelCatalogRefreshJob: (() => void) | null = null;
 let autoRefreshScheduler: AutoRefreshScheduler | null = null;
 let cacheKeepaliveScheduler: CacheKeepaliveScheduler | null = null;
+// Built once per server start (see startServer), shared across every
+// account's usage-poll snapshot callback — see startUsagePollingWithRefresh.
+let staleWeeklyResetRecovery: ReturnType<
+	typeof createStaleWeeklyResetRecovery
+> | null = null;
 let memoryMonitorInterval: Timer | null = null;
 // Track usage polling retry timeouts for cleanup
 const usagePollingRetryTimeouts = new Map<string, NodeJS.Timeout>();
@@ -578,6 +584,11 @@ function startUsagePollingWithRefresh(
 								`Failed to record usage snapshot for account ${accountId}: ${err}`,
 							),
 						);
+					staleWeeklyResetRecovery?.(accountId, data).catch((err: unknown) =>
+						logger.warn(
+							`Stale rate_limit_reset recovery failed for account ${accountId}: ${err}`,
+						),
+					);
 				},
 			);
 
@@ -1182,6 +1193,17 @@ export default async function startServer(options?: {
 		internalProbeSecret,
 	};
 	modelCatalogProxyContext = proxyContext;
+
+	// Issue #443 recovery: one instance per server start, shared across every
+	// Anthropic account's usage-poll snapshot (see startUsagePollingWithRefresh's
+	// onSnapshot composition below). isEnabled is read at fire time, not here,
+	// so toggling the config flag at runtime takes effect without a restart.
+	staleWeeklyResetRecovery = createStaleWeeklyResetRecovery({
+		now: () => Date.now(),
+		isEnabled: () => config.getClearStaleRateLimitResetEnabled(),
+		dbOps: proxyContext.dbOps,
+		log: new Logger("StaleWeeklyResetRecovery"),
+	});
 
 	// Register this server's refresh clearing capability
 	const serverId = `server-${runtime.port}`;
