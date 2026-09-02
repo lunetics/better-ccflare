@@ -45,6 +45,7 @@ import {
 	getProvider,
 	getRankingUtilizationForProvider,
 	setProviderModelDefaultOverrides,
+	type UsageData,
 	usageCache,
 } from "@better-ccflare/providers";
 import {
@@ -154,6 +155,10 @@ export function supportsRefreshBackedUsagePolling(
  * `@better-ccflare/providers`. Declared locally so the bootstrap helper
  * can be unit-tested with a mock without dragging the full UsageCache
  * class (which is not exported) into the public type surface.
+ *
+ * The trailing four parameters are optional so the Minimax registrar below
+ * (which only ever passes the first four) and the Anthropic/xAI registrar
+ * further down (which passes all eight) satisfy the same interface.
  */
 export interface UsageCacheRegistrar {
 	startPolling(
@@ -161,6 +166,10 @@ export interface UsageCacheRegistrar {
 		tokenProvider: () => Promise<string>,
 		provider: string,
 		intervalMs: number,
+		customEndpoint?: string | null,
+		onWindowReset?: (accountId: string) => void,
+		onCapacityRestored?: (accountId: string) => void,
+		onSnapshot?: (accountId: string, data: UsageData) => void,
 	): void;
 }
 
@@ -240,6 +249,112 @@ export function bootstrapMinimaxUsagePolling(
 		}
 	}
 	return registered;
+}
+
+/**
+ * Compose the `onSnapshot` callback registered for refresh-backed
+ * (Anthropic/xAI) accounts: always records the usage snapshot via
+ * `dbOps.recordUsageSnapshot`, and — when a stale-weekly-reset-recovery
+ * instance is available (the `clear_stale_rate_limit_reset` flag's handler,
+ * see `staleWeeklyResetRecovery` below; issue #443) — also forwards the
+ * snapshot to it. `recovery` is nullable because the module-level instance
+ * is only built once `startServer()` reaches the point where `config` and
+ * `dbOps` exist; a snapshot delivered before that (should not normally
+ * happen) is a no-op for the recovery half rather than a crash.
+ *
+ * Extracted from the inline callback `startUsagePollingWithRefresh` used to
+ * build in place, mirroring `registerMinimaxUsagePolling`'s extraction above:
+ * a regression test can now assert this composition directly, instead of
+ * only being able to observe it indirectly through `dbOps`/log side effects
+ * of the full token-refresh/retry machinery in `startUsagePollingWithRefresh`.
+ */
+export function buildAnthropicUsageSnapshotHandler(
+	dbOps: DatabaseOperations,
+	recovery: ((accountId: string, data: UsageData) => Promise<void>) | null,
+	logger: Logger,
+): (accountId: string, data: UsageData) => void {
+	return (accountId, data) => {
+		dbOps
+			.recordUsageSnapshot(accountId, data, Date.now())
+			.catch((err) =>
+				logger.warn(
+					`Failed to record usage snapshot for account ${accountId}: ${err}`,
+				),
+			);
+		recovery?.(accountId, data).catch((err: unknown) =>
+			logger.warn(
+				`Stale rate_limit_reset recovery failed for account ${accountId}: ${err}`,
+			),
+		);
+	};
+}
+
+/**
+ * Register usage polling for a single refresh-backed (Anthropic or xAI)
+ * account: window-reset, capacity-restored and snapshot callbacks, the last
+ * of which is built by {@link buildAnthropicUsageSnapshotHandler}. Extracted
+ * from the inline `usageCache.startPolling(...)` call in
+ * `startUsagePollingWithRefresh` so the exact wiring path — in particular,
+ * that the stale-weekly-reset-recovery handler actually gets composed into
+ * `onSnapshot` — is unit-testable with a `UsageCacheRegistrar` mock, the
+ * same gap `registerMinimaxUsagePolling`/`bootstrapMinimaxUsagePolling`
+ * above exist to close for the Minimax path. Behaviour is unchanged: the
+ * window-reset and capacity-restored callback bodies are copied verbatim
+ * from the block this replaces.
+ */
+export function registerAnthropicUsagePolling(
+	account: Account,
+	usageCache: UsageCacheRegistrar,
+	intervalMs: number,
+	tokenProvider: () => Promise<string>,
+	dbOps: DatabaseOperations,
+	recovery: ((accountId: string, data: UsageData) => Promise<void>) | null,
+	logger: Logger,
+): void {
+	usageCache.startPolling(
+		account.id,
+		tokenProvider,
+		account.provider,
+		intervalMs,
+		undefined, // customEndpoint
+		(accountId) => {
+			// Usage window has rolled over — reset session tracking so the
+			// dashboard reflects the new window without waiting for the next request.
+			dbOps
+				.resetAccountSession(accountId, Date.now())
+				.catch((err) =>
+					logger.warn(
+						`Failed to reset session for account ${accountId} on window reset: ${err}`,
+					),
+				);
+		},
+		(accountId) => {
+			// Usage API shows available capacity (<100%). If rate_limited_until is
+			// set in the future (seat-reassignment case), clear it now rather than
+			// waiting for the natural expiry timer — the polling loop has confirmed
+			// the seat is available again.
+			dbOps
+				.getAccount(accountId)
+				.then((acc) => {
+					if (
+						acc?.rate_limited_until &&
+						Number(acc.rate_limited_until) > Date.now()
+					) {
+						return dbOps.forceResetAccountRateLimit(accountId).then(() => {
+							logger.info(
+								`Cleared stale rate_limited_until for account ${acc.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
+							);
+						});
+					}
+				})
+				.catch((err) =>
+					logger.warn(
+						`Failed to check/clear rate_limited_until for account ${accountId} on capacity restore: ${err}`,
+					),
+				);
+		},
+		buildAnthropicUsageSnapshotHandler(dbOps, recovery, logger),
+	);
 }
 
 // Helper function to resolve dashboard assets with fallback
@@ -532,64 +647,14 @@ function startUsagePollingWithRefresh(
 			};
 
 			// Start usage polling with the token provider
-			usageCache.startPolling(
-				account.id,
-				tokenProvider,
-				account.provider,
+			registerAnthropicUsagePolling(
+				account,
+				usageCache,
 				intervalMs,
-				undefined, // customEndpoint
-				(accountId) => {
-					// Usage window has rolled over — reset session tracking so the
-					// dashboard reflects the new window without waiting for the next request.
-					proxyContext.dbOps
-						.resetAccountSession(accountId, Date.now())
-						.catch((err) =>
-							logger.warn(
-								`Failed to reset session for account ${accountId} on window reset: ${err}`,
-							),
-						);
-				},
-				(accountId) => {
-					// Usage API shows available capacity (<100%). If rate_limited_until is
-					// set in the future (seat-reassignment case), clear it now rather than
-					// waiting for the natural expiry timer — the polling loop has confirmed
-					// the seat is available again.
-					proxyContext.dbOps
-						.getAccount(accountId)
-						.then((acc) => {
-							if (
-								acc?.rate_limited_until &&
-								Number(acc.rate_limited_until) > Date.now()
-							) {
-								return proxyContext.dbOps
-									.forceResetAccountRateLimit(accountId)
-									.then(() => {
-										logger.info(
-											`Cleared stale rate_limited_until for account ${acc.name} (${accountId}): usage polling shows available capacity (seat reassignment or early reset)`,
-										);
-									});
-							}
-						})
-						.catch((err) =>
-							logger.warn(
-								`Failed to check/clear rate_limited_until for account ${accountId} on capacity restore: ${err}`,
-							),
-						);
-				},
-				(accountId, data) => {
-					proxyContext.dbOps
-						.recordUsageSnapshot(accountId, data, Date.now())
-						.catch((err) =>
-							logger.warn(
-								`Failed to record usage snapshot for account ${accountId}: ${err}`,
-							),
-						);
-					staleWeeklyResetRecovery?.(accountId, data).catch((err: unknown) =>
-						logger.warn(
-							`Stale rate_limit_reset recovery failed for account ${accountId}: ${err}`,
-						),
-					);
-				},
+				tokenProvider,
+				proxyContext.dbOps,
+				staleWeeklyResetRecovery,
+				logger,
 			);
 
 			// Reset retry count on success

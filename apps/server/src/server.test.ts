@@ -5,6 +5,8 @@ import { Logger, logBus } from "@better-ccflare/logger";
 import type { LogEvent } from "@better-ccflare/types";
 import {
 	bootstrapMinimaxUsagePolling,
+	buildAnthropicUsageSnapshotHandler,
+	registerAnthropicUsagePolling,
 	registerMinimaxUsagePolling,
 	supportsRefreshBackedUsagePolling,
 	type UsageCacheRegistrar,
@@ -594,6 +596,353 @@ describe("bootstrapMinimaxUsagePolling", () => {
 		const allData = JSON.stringify(captured.map((e) => e.data ?? null));
 		expect(allMessages).not.toContain(MARKER);
 		expect(allData).not.toContain(MARKER);
+	});
+});
+
+// internal-3 (issue #443 review): the sole line that made the
+// stale-weekly-reset-recovery flow do anything in production —
+// staleWeeklyResetRecovery?.(accountId, data) composed into onSnapshot —
+// was previously inline inside startUsagePollingWithRefresh's token-refresh
+// machinery and had no test able to isolate it: every existing test
+// exercised the recovery module, the repository, the config and the
+// scheduler predicate in isolation, but nothing asserted that the actual
+// onSnapshot callback registered for an Anthropic account invokes the
+// recovery handler. buildAnthropicUsageSnapshotHandler/
+// registerAnthropicUsagePolling extract that composition and its
+// registration into unit-testable helpers, following
+// registerMinimaxUsagePolling's precedent above.
+describe("buildAnthropicUsageSnapshotHandler", () => {
+	function makeDbOps() {
+		return {
+			recordUsageSnapshot: mock(async () => {}),
+		} as unknown as Parameters<typeof buildAnthropicUsageSnapshotHandler>[0];
+	}
+
+	it("records the usage snapshot", () => {
+		const dbOps = makeDbOps();
+		const logger = new Logger("SnapshotHandlerTest");
+		const handler = buildAnthropicUsageSnapshotHandler(dbOps, null, logger);
+
+		const data = { seven_day: { utilization: 10, resets_at: null } };
+		handler("acc-1", data as never);
+
+		const calls = (dbOps.recordUsageSnapshot as ReturnType<typeof mock>).mock
+			.calls;
+		expect(calls.length).toBe(1);
+		expect(calls[0]?.[0]).toBe("acc-1");
+		expect(calls[0]?.[1]).toBe(data);
+	});
+
+	it("invokes the recovery handler with the same accountId and data, in addition to recording the snapshot", async () => {
+		const dbOps = makeDbOps();
+		const logger = new Logger("SnapshotHandlerTest");
+		const recovery = mock(async (_accountId: string, _data: unknown) => {});
+		const handler = buildAnthropicUsageSnapshotHandler(dbOps, recovery, logger);
+
+		const data = { seven_day: { utilization: 0, resets_at: null } };
+		handler("acc-1", data as never);
+		// The handler fires both calls synchronously without awaiting them;
+		// flush microtasks so both promises settle before asserting.
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(
+			(dbOps.recordUsageSnapshot as ReturnType<typeof mock>).mock.calls.length,
+		).toBe(1);
+		expect(recovery).toHaveBeenCalledTimes(1);
+		expect(recovery).toHaveBeenCalledWith("acc-1", data);
+	});
+
+	it("does not throw and still records the snapshot when recovery is null", () => {
+		const dbOps = makeDbOps();
+		const logger = new Logger("SnapshotHandlerTest");
+		const handler = buildAnthropicUsageSnapshotHandler(dbOps, null, logger);
+
+		expect(() =>
+			handler("acc-1", {
+				seven_day: { utilization: 0, resets_at: null },
+			} as never),
+		).not.toThrow();
+		expect(
+			(dbOps.recordUsageSnapshot as ReturnType<typeof mock>).mock.calls.length,
+		).toBe(1);
+	});
+
+	it("logs a WARN instead of throwing when the recovery handler rejects", async () => {
+		const dbOps = makeDbOps();
+		const logger = new Logger("SnapshotHandlerTest");
+		const warn = mock((_message: string, _data?: unknown) => {});
+		logger.warn = warn as never;
+		const recovery = mock(async () => {
+			throw new Error("boom");
+		});
+		const handler = buildAnthropicUsageSnapshotHandler(dbOps, recovery, logger);
+
+		expect(() => handler("acc-1", {} as never)).not.toThrow();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[0]).toContain(
+			"Stale rate_limit_reset recovery failed for account acc-1",
+		);
+	});
+
+	it("logs a WARN instead of throwing when recordUsageSnapshot rejects", async () => {
+		const dbOps = {
+			recordUsageSnapshot: mock(async () => {
+				throw new Error("db down");
+			}),
+		} as unknown as Parameters<typeof buildAnthropicUsageSnapshotHandler>[0];
+		const logger = new Logger("SnapshotHandlerTest");
+		const warn = mock((_message: string, _data?: unknown) => {});
+		logger.warn = warn as never;
+		const handler = buildAnthropicUsageSnapshotHandler(dbOps, null, logger);
+
+		expect(() => handler("acc-1", {} as never)).not.toThrow();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0]?.[0]).toContain(
+			"Failed to record usage snapshot for account acc-1",
+		);
+	});
+});
+
+describe("registerAnthropicUsagePolling", () => {
+	function makeAccount(
+		overrides: Partial<{
+			id: string;
+			name: string;
+			provider: string;
+		}> = {},
+	) {
+		return {
+			id: "acc-1",
+			name: "anthropic-account-1",
+			provider: "anthropic",
+			...overrides,
+		} as unknown as Parameters<typeof registerAnthropicUsagePolling>[0];
+	}
+
+	function makeRegistrar() {
+		const startPolling = mock(
+			(
+				_accountId: string,
+				_tokenProvider: () => Promise<string>,
+				_provider: string,
+				_intervalMs: number,
+				_customEndpoint?: string | null,
+				_onWindowReset?: (accountId: string) => void,
+				_onCapacityRestored?: (accountId: string) => void,
+				_onSnapshot?: (accountId: string, data: unknown) => void,
+			) => {},
+		);
+		return {
+			registrar: { startPolling } as unknown as UsageCacheRegistrar,
+			startPolling,
+		};
+	}
+
+	function makeDbOps() {
+		return {
+			resetAccountSession: mock(async () => {}),
+			getAccount: mock(async () => null),
+			forceResetAccountRateLimit: mock(async () => true),
+			recordUsageSnapshot: mock(async () => {}),
+		} as unknown as Parameters<typeof registerAnthropicUsagePolling>[4];
+	}
+
+	it("registers polling with all eight positional arguments", async () => {
+		const { registrar, startPolling } = makeRegistrar();
+		const dbOps = makeDbOps();
+		const logger = new Logger("AnthropicPollingTest");
+		const tokenProvider = async () => "token";
+
+		registerAnthropicUsagePolling(
+			makeAccount(),
+			registrar,
+			90_000,
+			tokenProvider,
+			dbOps,
+			null,
+			logger,
+		);
+
+		expect(startPolling).toHaveBeenCalledTimes(1);
+		const call = startPolling.mock.calls[0];
+		expect(call?.[0]).toBe("acc-1");
+		expect(call?.[1]).toBe(tokenProvider);
+		expect(call?.[2]).toBe("anthropic");
+		expect(call?.[3]).toBe(90_000);
+		expect(call?.[4]).toBeUndefined(); // customEndpoint
+		expect(typeof call?.[5]).toBe("function"); // onWindowReset
+		expect(typeof call?.[6]).toBe("function"); // onCapacityRestored
+		expect(typeof call?.[7]).toBe("function"); // onSnapshot
+	});
+
+	// The exact assertion internal-3 asked for: the registered onSnapshot must
+	// invoke the recovery handler for an anthropic account, and must still
+	// record the usage snapshot alongside it.
+	it("the registered onSnapshot invokes the recovery handler for an anthropic account, and still records the usage snapshot", async () => {
+		const { registrar, startPolling } = makeRegistrar();
+		const dbOps = makeDbOps();
+		const logger = new Logger("AnthropicPollingTest");
+		const recovery = mock(async (_accountId: string, _data: unknown) => {});
+
+		registerAnthropicUsagePolling(
+			makeAccount({ id: "anthropic-42" }),
+			registrar,
+			90_000,
+			async () => "token",
+			dbOps,
+			recovery,
+			logger,
+		);
+
+		const onSnapshot = startPolling.mock.calls[0]?.[7] as (
+			accountId: string,
+			data: unknown,
+		) => void;
+		const data = { seven_day: { utilization: 0, resets_at: null } };
+		onSnapshot("anthropic-42", data);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(
+			(dbOps.recordUsageSnapshot as ReturnType<typeof mock>).mock.calls.length,
+		).toBe(1);
+		expect(recovery).toHaveBeenCalledTimes(1);
+		expect(recovery).toHaveBeenCalledWith("anthropic-42", data);
+	});
+
+	it("the registered onSnapshot still records the usage snapshot when no recovery instance is available", async () => {
+		const { registrar, startPolling } = makeRegistrar();
+		const dbOps = makeDbOps();
+		const logger = new Logger("AnthropicPollingTest");
+
+		registerAnthropicUsagePolling(
+			makeAccount(),
+			registrar,
+			90_000,
+			async () => "token",
+			dbOps,
+			null, // no recovery instance built yet
+			logger,
+		);
+
+		const onSnapshot = startPolling.mock.calls[0]?.[7] as (
+			accountId: string,
+			data: unknown,
+		) => void;
+		expect(() => onSnapshot("acc-1", {})).not.toThrow();
+
+		expect(
+			(dbOps.recordUsageSnapshot as ReturnType<typeof mock>).mock.calls.length,
+		).toBe(1);
+	});
+
+	it("the registered onWindowReset resets the account session (behaviour unchanged from the inline block)", async () => {
+		const { registrar, startPolling } = makeRegistrar();
+		const dbOps = makeDbOps();
+		const logger = new Logger("AnthropicPollingTest");
+
+		registerAnthropicUsagePolling(
+			makeAccount(),
+			registrar,
+			90_000,
+			async () => "token",
+			dbOps,
+			null,
+			logger,
+		);
+
+		const onWindowReset = startPolling.mock.calls[0]?.[5] as (
+			accountId: string,
+		) => void;
+		onWindowReset("acc-1");
+		await Promise.resolve();
+
+		const calls = (dbOps.resetAccountSession as ReturnType<typeof mock>).mock
+			.calls;
+		expect(calls.length).toBe(1);
+		expect(calls[0]?.[0]).toBe("acc-1");
+	});
+
+	it("the registered onCapacityRestored clears a future rate_limited_until (behaviour unchanged from the inline block)", async () => {
+		const { registrar, startPolling } = makeRegistrar();
+		const future = Date.now() + 60_000;
+		const dbOps = {
+			resetAccountSession: mock(async () => {}),
+			getAccount: mock(async () => ({
+				id: "acc-1",
+				name: "acc-1",
+				rate_limited_until: future,
+			})),
+			forceResetAccountRateLimit: mock(async () => true),
+			recordUsageSnapshot: mock(async () => {}),
+		} as unknown as Parameters<typeof registerAnthropicUsagePolling>[4];
+		const logger = new Logger("AnthropicPollingTest");
+
+		registerAnthropicUsagePolling(
+			makeAccount(),
+			registrar,
+			90_000,
+			async () => "token",
+			dbOps,
+			null,
+			logger,
+		);
+
+		const onCapacityRestored = startPolling.mock.calls[0]?.[6] as (
+			accountId: string,
+		) => void;
+		onCapacityRestored("acc-1");
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(
+			(dbOps.forceResetAccountRateLimit as ReturnType<typeof mock>).mock.calls
+				.length,
+		).toBe(1);
+	});
+});
+
+// Structural guard mirroring the "startServer() wiring guards" pattern
+// below: a passing unit test on registerAnthropicUsagePolling alone would
+// not have caught the actual internal-3 gap, which was that nothing called
+// it at all — the same PR #347 class of regression (a working helper that
+// production never invokes) the Minimax guard exists to catch. This reads
+// the source off disk and asserts startUsagePollingWithRefresh's body
+// still calls registerAnthropicUsagePolling.
+describe("startUsagePollingWithRefresh wiring guard", () => {
+	function readFunctionBody(functionName: string): string {
+		const src = readFileSync(join(import.meta.dir, "server.ts"), "utf8");
+		const match = src.match(
+			new RegExp(`function\\s+${functionName}\\b[\\s\\S]*?\\)\\s*\\{`),
+		);
+		if (!match || match.index === undefined) {
+			throw new Error(
+				`${functionName} not found in server.ts — update the wiring guard string`,
+			);
+		}
+		const openIdx = match.index + match[0].length - 1;
+		let depth = 0;
+		for (let i = openIdx; i < src.length; i++) {
+			const ch = src[i];
+			if (ch === "{") depth++;
+			else if (ch === "}") {
+				depth--;
+				if (depth === 0) return src.slice(openIdx, i + 1);
+			}
+		}
+		throw new Error(`${functionName} body closing brace not found`);
+	}
+
+	it("startUsagePollingWithRefresh invokes registerAnthropicUsagePolling", () => {
+		const body = readFunctionBody("startUsagePollingWithRefresh");
+		expect(body).toMatch(/registerAnthropicUsagePolling\s*\(/);
 	});
 });
 
