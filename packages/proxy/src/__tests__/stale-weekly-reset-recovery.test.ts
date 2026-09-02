@@ -268,6 +268,42 @@ describe("createStaleWeeklyResetRecovery — gates", () => {
 		expect(info).toHaveBeenCalledTimes(1);
 	});
 
+	it("does not warn on the next matching poll after a successful write in the same episode", async () => {
+		// Mirrors what a successful CAS write actually does in production: the
+		// account row's rate_limit_reset becomes `now` (past), so the very next
+		// poll's horizon gate would reject it — that must not produce a WARN
+		// contradicting the INFO line the write just logged. Unlike makeDeps'
+		// static account fixture, getAccount here reads a mutable object that
+		// markStaleRateLimitResetPassed updates, so the horizon gate actually
+		// sees the post-write value on poll 3, reproducing the real sequence.
+		const now = 1_700_000_000_000;
+		const staleReset = now + 5 * DAY;
+		const account = makeAccount({ rate_limit_reset: staleReset });
+		const getAccount = mock(async () => account);
+		const markStaleRateLimitResetPassed = mock(
+			async (_id: string, _observed: number, writeNow: number) => {
+				account.rate_limit_reset = writeNow;
+				return true;
+			},
+		);
+		const warn = mock(() => {});
+		const info = mock(() => {});
+		const recover = createStaleWeeklyResetRecovery({
+			now: () => now,
+			isEnabled: () => true,
+			dbOps: { getAccount, markStaleRateLimitResetPassed },
+			log: { warn, info },
+		});
+
+		await recover("acc-1", FRESH_WINDOW); // streak 1
+		await recover("acc-1", FRESH_WINDOW); // streak 2 — writes, applies
+		await recover("acc-1", FRESH_WINDOW); // streak 3 — post-write, still matching
+
+		expect(markStaleRateLimitResetPassed).toHaveBeenCalledTimes(1);
+		expect(info).toHaveBeenCalledTimes(1);
+		expect(warn).not.toHaveBeenCalled();
+	});
+
 	it("does not log success info when the CAS write is a no-op (concurrent change)", async () => {
 		const now = 1_700_000_000_000;
 		const staleReset = now + 5 * DAY;

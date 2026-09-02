@@ -154,6 +154,11 @@ export function createStaleWeeklyResetRecovery(
 			deps.log.info(
 				`Cleared stale rate_limit_reset for account ${label}: was ${new Date(observedReset).toISOString()}, usage poll shows a zero, unscheduled weekly window (likely reset out of band)`,
 			);
+			// Latch the episode: the write just moved rate_limit_reset to `now`
+			// (past), so the very next poll's horizon gate will reject it —
+			// without this, that rejection would emit a WARN saying the
+			// recovery was "skipped" right after the INFO line said it applied.
+			warnedThisEpisode.set(accountId, true);
 		}
 	};
 }
