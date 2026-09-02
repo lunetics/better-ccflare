@@ -3,6 +3,7 @@ import type { AnyUsageData, UsageData } from "../usage-fetcher";
 import {
 	extractWeeklyResetTime,
 	extractWindowResetTime,
+	hasZeroUnscheduledWeeklyUsage,
 	usageCache,
 } from "../usage-fetcher";
 import type { XaiUsageData } from "../xai-usage-fetcher";
@@ -120,6 +121,148 @@ describe("extractWeeklyResetTime", () => {
 		expect(extractWeeklyResetTime({} as any, "zai")).toBeNull();
 		expect(extractWeeklyResetTime({} as any, "xai")).toBeNull();
 		expect(extractWeeklyResetTime({} as any, "nanogpt")).toBeNull();
+	});
+});
+
+// ── hasZeroUnscheduledWeeklyUsage ──────────────────────────────────────────
+//
+// The fetcher-level fact issue #443's recovery module gates on: the weekly
+// window reports zero usage AND no scheduled reset, which is the payload
+// signature Anthropic sends right after resetting a window out of band
+// (while `accounts.rate_limit_reset` still holds a stale future value from
+// an earlier 429). Fails closed on anything that isn't unambiguously that
+// signature — a false positive here would clear a legitimately future
+// rate_limit_reset.
+
+describe("hasZeroUnscheduledWeeklyUsage", () => {
+	it("returns true for seven_day utilization 0 with resets_at null", () => {
+		const data: UsageData = { seven_day: { utilization: 0, resets_at: null } };
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(true);
+	});
+
+	it("returns true for seven_day utilization 0 with resets_at absent", () => {
+		const data = {
+			seven_day: { utilization: 0 },
+		} as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(true);
+	});
+
+	it("returns true for a limits-only weekly_all entry at 0% with no resets_at", () => {
+		const data = {
+			limits: [
+				{ kind: "weekly_all", percent: 0, resets_at: null, scope: null },
+			],
+		} as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(true);
+	});
+
+	it("returns false when the weekly_all entry is explicitly inactive", () => {
+		const data = {
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 0,
+					resets_at: null,
+					scope: null,
+					is_active: false,
+				},
+			],
+		} as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("returns false when seven_day utilization is above 0", () => {
+		const data: UsageData = { seven_day: { utilization: 5, resets_at: null } };
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("returns false when resets_at is present even at 0% utilization", () => {
+		const data: UsageData = {
+			seven_day: { utilization: 0, resets_at: "2030-01-08T12:00:00Z" },
+		};
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("returns false when neither seven_day nor a weekly_all limits entry is present", () => {
+		const data: UsageData = {
+			five_hour: { utilization: 0, resets_at: null },
+		};
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("returns false for an empty payload", () => {
+		expect(hasZeroUnscheduledWeeklyUsage({} as UsageData, "anthropic")).toBe(
+			false,
+		);
+	});
+
+	it("returns false when seven_day and the weekly_all limits entry disagree", () => {
+		// seven_day reads as fresh (0%, no reset) but the limits[] weekly_all
+		// entry still carries a scheduled reset — a genuinely fresh window
+		// would agree in both representations, so a mismatch fails closed.
+		const disagreeingReset: UsageData = {
+			seven_day: { utilization: 0, resets_at: null },
+			limits: [
+				{
+					kind: "weekly_all",
+					percent: 0,
+					resets_at: "2030-01-08T12:00:00Z",
+					scope: null,
+				},
+			],
+		} as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(disagreeingReset, "anthropic")).toBe(
+			false,
+		);
+
+		const disagreeingUtilization: UsageData = {
+			seven_day: { utilization: 0, resets_at: null },
+			limits: [
+				{ kind: "weekly_all", percent: 12, resets_at: null, scope: null },
+			],
+		} as unknown as UsageData;
+		expect(
+			hasZeroUnscheduledWeeklyUsage(disagreeingUtilization, "anthropic"),
+		).toBe(false);
+	});
+
+	it("returns false for a non-anthropic provider even with a matching payload shape", () => {
+		const data: UsageData = { seven_day: { utilization: 0, resets_at: null } };
+		expect(hasZeroUnscheduledWeeklyUsage(data, "codex")).toBe(false);
+		expect(hasZeroUnscheduledWeeklyUsage(data, "xai")).toBe(false);
+		expect(hasZeroUnscheduledWeeklyUsage(data, "zai")).toBe(false);
+	});
+
+	it("agrees with extractWeeklyResetTime on which entry carries the reset", () => {
+		// Same limits-only payload extractWeeklyResetTime's own test reads via
+		// the weekly_all fallback — pins that both functions select the same
+		// entry rather than drifting apart under a future edit.
+		const resetIso = "2030-03-08T00:00:00.000Z";
+		const limitsOnly = {
+			limits: [
+				{ kind: "session", percent: 40, resets_at: null, scope: null },
+				{ kind: "weekly_all", percent: 0, resets_at: resetIso, scope: null },
+			],
+		} as unknown as UsageData;
+
+		// extractWeeklyResetTime reads the weekly_all entry's resets_at...
+		expect(extractWeeklyResetTime(limitsOnly, "anthropic")).toBe(
+			new Date(resetIso).getTime(),
+		);
+		// ...and hasZeroUnscheduledWeeklyUsage reads the very same entry: a
+		// present resets_at fails the "unscheduled" check even at 0%.
+		expect(hasZeroUnscheduledWeeklyUsage(limitsOnly, "anthropic")).toBe(false);
+
+		const limitsOnlyFresh = {
+			limits: [
+				{ kind: "session", percent: 40, resets_at: null, scope: null },
+				{ kind: "weekly_all", percent: 0, resets_at: null, scope: null },
+			],
+		} as unknown as UsageData;
+		expect(extractWeeklyResetTime(limitsOnlyFresh, "anthropic")).toBeNull();
+		expect(hasZeroUnscheduledWeeklyUsage(limitsOnlyFresh, "anthropic")).toBe(
+			true,
+		);
 	});
 });
 

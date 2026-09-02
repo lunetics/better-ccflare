@@ -162,6 +162,27 @@ export function extractWindowResetTime(
 }
 
 /**
+ * Locate the account-level weekly window's two possible representations in
+ * an Anthropic/Codex usage payload: the flat `seven_day` field (legacy) and
+ * the generic `limits[]` entry with `kind === "weekly_all"` (2026 API).
+ * Shared by {@link extractWeeklyResetTime} and
+ * {@link hasZeroUnscheduledWeeklyUsage} so the two can never read a
+ * different entry from each other — a drift there would let one function's
+ * "no reset" disagree with the other's "no reset" for the same payload.
+ */
+function getWeeklyWindowEntries(data: UsageData): {
+	sevenDay: UsageWindow | undefined;
+	weeklyAll: UsageLimit | undefined;
+} {
+	return {
+		sevenDay: data.seven_day,
+		weeklyAll: Array.isArray(data.limits)
+			? data.limits.find((l) => l?.kind === "weekly_all")
+			: undefined,
+	};
+}
+
+/**
  * Extract the weekly_all (all-models weekly) window reset timestamp (ms).
  * Distinct from {@link extractWindowResetTime}, which prefers the shorter
  * five_hour/session window — this reads specifically the account-level
@@ -175,17 +196,61 @@ export function extractWeeklyResetTime(
 	provider: string,
 ): number | null {
 	if (provider !== "anthropic" && provider !== "codex") return null;
-	const d = data as UsageData;
+	const { sevenDay, weeklyAll } = getWeeklyWindowEntries(data as UsageData);
 	// Prefer the flat seven_day window; fall back to the limits[] weekly_all
 	// entry so limits-only payloads still expose a weekly reset time.
-	const resetsAt =
-		d.seven_day?.resets_at ??
-		(Array.isArray(d.limits)
-			? (d.limits.find((l) => l?.kind === "weekly_all")?.resets_at ?? null)
-			: null);
+	const resetsAt = sevenDay?.resets_at ?? weeklyAll?.resets_at ?? null;
 	if (!resetsAt) return null;
 	const ms = new Date(resetsAt).getTime();
 	return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * True iff the weekly_all window in this payload unambiguously shows a
+ * freshly reset window: zero usage and no scheduled reset. This is the
+ * signature Anthropic's usage API sends immediately after resetting a
+ * weekly window out of band (issue #443) — before that, the same account's
+ * `accounts.rate_limit_reset` column can still hold a stale future value
+ * from an earlier 429, since that column is only ever written from response
+ * headers, not from usage polls.
+ *
+ * Anthropic only (unlike {@link extractWeeklyResetTime}, which also serves
+ * Codex) — the recovery flow this feeds only clears Anthropic accounts'
+ * stale `rate_limit_reset`.
+ *
+ * Fails closed: an absent weekly representation, a nonzero utilization, a
+ * present `resets_at` (even at 0%), an explicitly inactive limits[] entry,
+ * or the two representations disagreeing with each other all return false.
+ * A false positive here would clear a legitimately future rate_limit_reset
+ * and starve the scheduler's cooldown logic for no reason.
+ */
+export function hasZeroUnscheduledWeeklyUsage(
+	data: AnyUsageData,
+	provider: string,
+): boolean {
+	if (provider !== "anthropic") return false;
+	const { sevenDay, weeklyAll } = getWeeklyWindowEntries(data as UsageData);
+
+	const sevenDayZero =
+		sevenDay !== undefined
+			? typeof sevenDay.utilization === "number" &&
+				sevenDay.utilization === 0 &&
+				!sevenDay.resets_at
+			: null;
+	const weeklyAllZero =
+		weeklyAll !== undefined
+			? typeof weeklyAll.percent === "number" &&
+				weeklyAll.percent === 0 &&
+				!weeklyAll.resets_at &&
+				weeklyAll.is_active !== false
+			: null;
+
+	if (sevenDayZero === null && weeklyAllZero === null) return false; // absent
+	if (sevenDayZero !== null && weeklyAllZero !== null) {
+		// Both representations present: they must agree, else fail closed.
+		return sevenDayZero && weeklyAllZero;
+	}
+	return (sevenDayZero ?? weeklyAllZero) === true;
 }
 
 /**
