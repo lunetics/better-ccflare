@@ -128,6 +128,7 @@ export interface ConfigData {
 	provider_model_default_overrides?: ProviderModelDefaultOverrides;
 	agent_frontmatter_model_fallback?: boolean;
 	model_catalog_oauth_refresh_enabled?: boolean;
+	clear_stale_rate_limit_reset?: boolean;
 	health_detail_enabled?: boolean;
 	alert_daily_spend_usd?: number;
 	alert_tokens_per_hour?: number;
@@ -657,6 +658,62 @@ export class Config extends EventEmitter {
 		return false;
 	}
 
+	/**
+	 * env > file > default precedence for the stale-rate-limit-reset recovery
+	 * flag, mirroring resolveEnvFileSetting's shape for a boolean setting
+	 * whose env encoding is parseEnabledEnvFlag rather than a string enum.
+	 */
+	private resolveClearStaleRateLimitReset(): {
+		value: boolean;
+		source: "env" | "file" | "default";
+	} {
+		const fromEnv = parseEnabledEnvFlag(
+			process.env.BETTER_CCFLARE_CLEAR_STALE_RATE_LIMIT_RESET,
+		);
+		if (fromEnv !== undefined) {
+			return { value: fromEnv, source: "env" };
+		}
+		const fromFile = this.data.clear_stale_rate_limit_reset;
+		if (typeof fromFile === "boolean") {
+			return { value: fromFile, source: "file" };
+		}
+		return { value: false, source: "default" };
+	}
+
+	/**
+	 * Whether the proxy's usage-poll snapshot handler is allowed to clear a
+	 * stale `rate_limit_reset` on an Anthropic account whose weekly window
+	 * was reset out of band (see `hasZeroUnscheduledWeeklyUsage` / issue
+	 * #443: the field is only ever written from response headers, so an
+	 * account that stops receiving requests keeps a stale future value even
+	 * after its usage telemetry shows a fresh window, which starves it from
+	 * both the auto-refresh probe and drain-soonest ranking).
+	 *
+	 * Defaults to false: acting on an inferred contradiction between two
+	 * independent signals (usage telemetry vs. the stored reset) is a
+	 * meaningful behaviour change for anyone not hitting the bug, so it
+	 * ships opt-in until field data confirms the detection is safe broadly
+	 * enough to flip the default.
+	 */
+	getClearStaleRateLimitResetEnabled(): boolean {
+		return this.resolveClearStaleRateLimitReset().value;
+	}
+
+	/**
+	 * Report where the effective value comes from, mirroring the precedence
+	 * in getClearStaleRateLimitResetEnabled(): a valid
+	 * BETTER_CCFLARE_CLEAR_STALE_RATE_LIMIT_RESET env value wins ("env"),
+	 * else a valid config-file field ("file"), else the built-in default
+	 * ("default").
+	 */
+	getClearStaleRateLimitResetEnabledSource(): "env" | "file" | "default" {
+		return this.resolveClearStaleRateLimitReset().source;
+	}
+
+	setClearStaleRateLimitResetEnabled(value: boolean): void {
+		this.set("clear_stale_rate_limit_reset", value);
+	}
+
 	setUsageThrottlingFiveHourEnabled(value: boolean): void {
 		this.set("usage_throttling_five_hour_enabled", value);
 	}
@@ -1133,6 +1190,7 @@ export class Config extends EventEmitter {
 			agent_frontmatter_model_fallback: this.getAgentFrontmatterModelFallback(),
 			model_catalog_oauth_refresh_enabled:
 				this.getModelCatalogOAuthRefreshEnabled(),
+			clear_stale_rate_limit_reset: this.getClearStaleRateLimitResetEnabled(),
 			health_detail_enabled: this.getHealthDetailEnabled(),
 			alert_daily_spend_usd: this.getAlertDailySpendUsd(),
 			alert_tokens_per_hour: this.getAlertTokensPerHour(),
