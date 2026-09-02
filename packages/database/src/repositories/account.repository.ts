@@ -352,6 +352,49 @@ export class AccountRepository extends BaseRepository<Account> {
 		);
 	}
 
+	/**
+	 * Compare-and-set recovery write for issue #443: an Anthropic account's
+	 * weekly window was reset out of band (usage now reports zero, unscheduled
+	 * usage — see `hasZeroUnscheduledWeeklyUsage`), but `rate_limit_reset`
+	 * still holds a stale future value from an earlier 429, which excludes the
+	 * account from both `AutoRefreshScheduler`'s probe eligibility and
+	 * drain-soonest ranking. Setting the field to `now` (a past timestamp)
+	 * rather than NULL matters: `AutoRefreshScheduler.shouldRefreshAccount`
+	 * treats a NULL `rate_limit_reset` as "skip" once it has ever refreshed
+	 * the account, but treats a past timestamp as "new window, probe it" —
+	 * only the latter unblocks the scheduler's next tick, which repopulates
+	 * the real reset from response headers.
+	 *
+	 * Guarded on the caller's last-observed `rate_limit_reset` value so a
+	 * concurrent request that already rewrote the column from a real response
+	 * (a genuine 429, or the scheduler's own probe) is not clobbered — the
+	 * WHERE clause simply matches no row and this becomes a no-op.
+	 *
+	 * Deliberately narrow: `rate_limited_until`, `rate_limited_reason`,
+	 * `rate_limited_at` and `consecutive_rate_limits` form the cooldown/audit
+	 * tuple and are left untouched — unlike {@link clearRateLimitState}, this
+	 * is not a full reset, only a correction of the one field that was wrong.
+	 *
+	 * @returns the number of rows updated (0 or 1) — 0 means either the
+	 * account doesn't exist, isn't `provider = 'anthropic'`, or the observed
+	 * value no longer matched.
+	 */
+	async markStaleRateLimitResetPassed(
+		accountId: string,
+		observedReset: number,
+		now: number,
+	): Promise<number> {
+		return this.runWithChanges(
+			`UPDATE accounts
+			 SET
+			 	rate_limit_reset = ?,
+			 	rate_limit_status = NULL,
+			 	rate_limit_remaining = NULL
+			 WHERE id = ? AND provider = 'anthropic' AND rate_limit_reset = ?`,
+			[now, accountId, observedReset],
+		);
+	}
+
 	async pause(accountId: string, reason = "manual"): Promise<void> {
 		await this.run(
 			`UPDATE accounts SET paused = 1, pause_reason = ? WHERE id = ?`,

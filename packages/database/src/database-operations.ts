@@ -975,6 +975,31 @@ OAuth tokens will need to be re-authenticated.
 		);
 	}
 
+	/**
+	 * See {@link AccountRepository.markStaleRateLimitResetPassed}. Returns
+	 * whether the write actually applied — unlike forceResetAccountRateLimit
+	 * above, a false here is a meaningful "someone else already fixed it",
+	 * not just a plumbing detail, so it is not folded into `>= 0`.
+	 */
+	async markStaleRateLimitResetPassed(
+		accountId: string,
+		observedReset: number,
+		now: number,
+	): Promise<boolean> {
+		return withDatabaseRetry(
+			async () => {
+				const changes = await this.accounts.markStaleRateLimitResetPassed(
+					accountId,
+					observedReset,
+					now,
+				);
+				return changes > 0;
+			},
+			this.retryConfig,
+			"markStaleRateLimitResetPassed",
+		);
+	}
+
 	async pauseAccount(accountId: string, reason = "manual"): Promise<void> {
 		await this.accounts.pause(accountId, reason);
 	}
