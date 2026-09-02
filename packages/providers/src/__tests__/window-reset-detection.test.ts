@@ -196,6 +196,31 @@ describe("hasZeroUnscheduledWeeklyUsage", () => {
 		);
 	});
 
+	it("fails closed (does not throw) when seven_day is explicitly null", () => {
+		const data = { seven_day: null } as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("fails closed (does not throw) when limits is explicitly null", () => {
+		const data = { limits: null } as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("fails closed (does not throw) when both seven_day and limits are null", () => {
+		const data = { seven_day: null, limits: null } as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(false);
+	});
+
+	it("treats a null seven_day as absent and falls through to a present weekly_all entry", () => {
+		const data = {
+			seven_day: null,
+			limits: [
+				{ kind: "weekly_all", percent: 0, resets_at: null, scope: null },
+			],
+		} as unknown as UsageData;
+		expect(hasZeroUnscheduledWeeklyUsage(data, "anthropic")).toBe(true);
+	});
+
 	it("returns false when seven_day and the weekly_all limits entry disagree", () => {
 		// seven_day reads as fresh (0%, no reset) but the limits[] weekly_all
 		// entry still carries a scheduled reset — a genuinely fresh window

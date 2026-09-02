@@ -232,7 +232,7 @@ export function hasZeroUnscheduledWeeklyUsage(
 	const { sevenDay, weeklyAll } = getWeeklyWindowEntries(data as UsageData);
 
 	const sevenDayZero =
-		sevenDay !== undefined
+		sevenDay != null
 			? typeof sevenDay.utilization === "number" &&
 				sevenDay.utilization === 0 &&
 				!sevenDay.resets_at
