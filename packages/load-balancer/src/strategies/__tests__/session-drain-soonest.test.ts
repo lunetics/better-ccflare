@@ -249,6 +249,69 @@ describe("SessionDrainSoonestStrategy", () => {
 	});
 
 	// -------------------------------------------------------------------------
+	// Characterization (issue #443): "strict" mode's canonical comparator
+	// sorts an unknown weekly reset behind every account with a known future
+	// reset — same rule as "sticky" mode's compareAccounts above, but this
+	// pins it specifically for compareAccountsStrict, which is what the
+	// issue's "session-drain-soonest-strict" title actually names. This is
+	// CURRENT, intended behavior for a legitimately-unknown reset (no usage
+	// telemetry yet) — it is also, unmodified, the mechanism issue #443
+	// reports: an account whose weekly window was reset out of band reports
+	// utilization 0 with no resets_at (same as "unknown" here) and sorts
+	// last, even though its real reset turns out to be earliest. The opt-in
+	// `clear_stale_rate_limit_reset` recovery flag works around the
+	// consequence (a stuck `rate_limit_reset` blocking the probe that would
+	// populate a real reset) without changing this ranking rule itself.
+	// -------------------------------------------------------------------------
+	describe("strict mode — ranking by weekly reset (characterization)", () => {
+		let strictStrategy: SessionDrainSoonestStrategy;
+		let strictStore: MockStrategyStore;
+		let strictMeta: RequestMeta;
+
+		beforeEach(() => {
+			strictStrategy = new SessionDrainSoonestStrategy(
+				5 * 60 * 60 * 1000,
+				"strict",
+			);
+			strictStore = new MockStrategyStore();
+			strictStrategy.initialize(strictStore);
+			strictMeta = {
+				id: "test-request-strict",
+				headers: new Headers(),
+				path: "/v1/messages",
+				method: "POST",
+				timestamp: Date.now(),
+			};
+		});
+
+		it("sorts an available account with an unknown weekly reset behind every account with a known future reset", () => {
+			const now = Date.now();
+
+			const knownReset = makeAccount({
+				id: "known-reset",
+				name: "known-reset",
+				priority: 9,
+			});
+			const unknownReset = makeAccount({
+				id: "unknown-reset",
+				name: "unknown-reset",
+				priority: 0, // higher priority, but must still sort behind known reset
+			});
+
+			strictStore.setWeeklyReset("known-reset", now + 60 * 60 * 1000);
+			// unknownReset: no entry in weeklyResetMap → null
+
+			const result = strictStrategy.select(
+				[unknownReset, knownReset],
+				strictMeta,
+			);
+
+			expect(result[0]).toBe(knownReset);
+			expect(result[1]).toBe(unknownReset);
+		});
+	});
+
+	// -------------------------------------------------------------------------
 	// v3: session stickiness — NO mid-session preemption. Drain-soonest ranking
 	// only governs which account is chosen at a fresh/re-selection (session
 	// start, session expiry, account unavailable). An active session keeps its
