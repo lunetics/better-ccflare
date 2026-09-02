@@ -433,6 +433,12 @@ export class APIRouter {
 		this.handlers.set("POST:/api/config/combos-enabled", (req) =>
 			configHandlers.setCombosEnabled(req),
 		);
+		this.handlers.set("GET:/api/config/clear-stale-rate-limit-reset", () =>
+			configHandlers.getClearStaleRateLimitReset(),
+		);
+		this.handlers.set("POST:/api/config/clear-stale-rate-limit-reset", (req) =>
+			configHandlers.setClearStaleRateLimitReset(req),
+		);
 		this.handlers.set("GET:/api/config/combo-session-fallback", () =>
 			configHandlers.getComboSessionFallback(),
 		);

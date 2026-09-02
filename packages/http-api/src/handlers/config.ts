@@ -434,6 +434,35 @@ export function createConfigHandlers(
 			});
 		},
 
+		getClearStaleRateLimitReset: (): Response => {
+			return jsonResponse({
+				enabled: config.getClearStaleRateLimitResetEnabled(),
+				source: config.getClearStaleRateLimitResetEnabledSource(),
+			});
+		},
+
+		setClearStaleRateLimitReset: async (req: Request): Promise<Response> => {
+			const body = await req.json();
+			if (typeof body.enabled !== "boolean") {
+				return errorResponse(
+					BadRequest(
+						"Invalid clear-stale-rate-limit-reset payload: expected 'enabled' to be a boolean",
+					),
+				);
+			}
+			config.setClearStaleRateLimitResetEnabled(body.enabled);
+			// Same shape as setModelCapacityRouting/setCombosEnabled: report the
+			// post-set EFFECTIVE value, so the dashboard shows what the server
+			// confirmed rather than what it asked for (an env override can make
+			// the write ineffective).
+			return jsonResponse({
+				success: true,
+				enabled: body.enabled,
+				source: config.getClearStaleRateLimitResetEnabledSource(),
+				effective: config.getClearStaleRateLimitResetEnabled(),
+			});
+		},
+
 		getComboSessionFallback: (): Response => {
 			return jsonResponse({
 				enabled: config.getComboSessionFallback(),

@@ -39,6 +39,9 @@ function makeConfig() {
 		getModelScopedCapacityRouting: () => "off" as const,
 		getModelScopedCapacityRoutingSource: () => "default" as const,
 		setModelScopedCapacityRouting: mock(() => {}),
+		getClearStaleRateLimitResetEnabled: () => false,
+		getClearStaleRateLimitResetEnabledSource: () => "default" as const,
+		setClearStaleRateLimitResetEnabled: mock(() => {}),
 		getStrategy: () => "session",
 		getStrategySource: () => "default" as const,
 		setStrategy: mock(() => {}),
@@ -168,6 +171,68 @@ describe("createConfigHandlers", () => {
 
 		expect(response.status).toBe(400);
 		expect(config.setModelScopedCapacityRouting).not.toHaveBeenCalled();
+	});
+
+	it("reports the current clear-stale-rate-limit-reset flag with its source", async () => {
+		const config = makeConfig();
+		const handlers = createConfigHandlers(config, {
+			port: 8080,
+			tlsEnabled: false,
+		});
+
+		const response = handlers.getClearStaleRateLimitReset();
+		const body = (await response.json()) as {
+			enabled: boolean;
+			source: string;
+		};
+		expect(body.enabled).toBe(false);
+		expect(body.source).toBe("default");
+	});
+
+	it("updates the clear-stale-rate-limit-reset flag from POST body (200 + echo)", async () => {
+		const config = makeConfig();
+		const handlers = createConfigHandlers(config, {
+			port: 8080,
+			tlsEnabled: false,
+		});
+
+		const response = await handlers.setClearStaleRateLimitReset(
+			new Request("http://localhost/api/config/clear-stale-rate-limit-reset", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ enabled: true }),
+			}),
+		);
+
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as {
+			success: boolean;
+			enabled: boolean;
+		};
+		expect(body.success).toBe(true);
+		expect(body.enabled).toBe(true);
+		expect(config.setClearStaleRateLimitResetEnabled).toHaveBeenCalledWith(
+			true,
+		);
+	});
+
+	it("rejects a non-boolean clear-stale-rate-limit-reset payload with 400", async () => {
+		const config = makeConfig();
+		const handlers = createConfigHandlers(config, {
+			port: 8080,
+			tlsEnabled: false,
+		});
+
+		const response = await handlers.setClearStaleRateLimitReset(
+			new Request("http://localhost/api/config/clear-stale-rate-limit-reset", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ enabled: "yes" }),
+			}),
+		);
+
+		expect(response.status).toBe(400);
+		expect(config.setClearStaleRateLimitResetEnabled).not.toHaveBeenCalled();
 	});
 
 	it("rejects a default agent model without a recognized Claude family substring", async () => {
