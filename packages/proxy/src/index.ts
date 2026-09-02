@@ -103,6 +103,10 @@ export {
 	forwardToClient,
 	type ResponseHandlerOptions,
 } from "./response-handler";
+export {
+	createStaleWeeklyResetRecovery,
+	type StaleWeeklyResetRecoveryDeps,
+} from "./stale-weekly-reset-recovery";
 export type { ProxyRequest, ProxyResponse } from "./types";
 export type { UsageCollectorHealth } from "./usage-collector";
 export type {
